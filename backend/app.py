@@ -5,6 +5,7 @@ from langchain_community.embeddings import OllamaEmbeddings
 from langchain_community.vectorstores import Chroma
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.chains import ConversationalRetrievalChain
+from langchain.prompts import PromptTemplate
 from pydantic import BaseModel
 import os
 import json
@@ -21,8 +22,8 @@ app.add_middleware(
 )
 
 # 初始化Ollama模型
-llm = Ollama(base_url="http://localhost:11434", model="llama2:13b")
-embeddings = OllamaEmbeddings(base_url="http://localhost:11434", model="llama2:13b")
+llm = Ollama(base_url="http://localhost:11434", model="llama3.2:latest")
+embeddings = OllamaEmbeddings(base_url="http://localhost:11434", model="llama3.2:latest")
 
 # 初始化向量數據庫
 if not os.path.exists("vectorstore"):
@@ -45,55 +46,169 @@ async def chat(request: ChatRequest):
         if request.use_rag:
             print(f"Searching for: {request.message}")
             
-            retriever = vectorstore.as_retriever(
-                search_type="similarity",
-                search_kwargs={
-                    "k": 3
-                }
-            )
+            # 獲取知識庫總文檔數
+            try:
+                total_docs = vectorstore._collection.count()
+                print(f"Total documents in knowledge base: {total_docs}")
+                
+                # 動態計算檢索數量
+                k = total_docs  # 直接使用總文檔數
+                fetch_k = min(total_docs, k + 4)  # 確保 fetch_k 不超過總文檔數
+                
+                print(f"Using k={k}, fetch_k={fetch_k}")
+                
+                retriever = vectorstore.as_retriever(
+                    search_type="mmr",
+                    search_kwargs={
+                        "k": k,  # 動態設置返回文檔數量
+                        "fetch_k": fetch_k,  # 動態設置初始檢索數量
+                        "lambda_mult": 0.9  # 相關性權重
+                    }
+                )
+            except Exception as e:
+                print(f"Error getting document count, using default values: {str(e)}")
+                # 使用預設值
+                retriever = vectorstore.as_retriever(
+                    search_type="mmr",
+                    search_kwargs={
+                        "k": 5,
+                        "fetch_k": 8,
+                        "lambda_mult": 0.9
+                    }
+                )
             
             # 獲取相關文檔
-            relevant_docs = retriever.get_relevant_documents(request.message)
-            print(f"Found {len(relevant_docs)} relevant documents")
+            try:
+                # 使用 invoke 替代 get_relevant_documents
+                retriever_output = retriever.invoke(request.message)
+                relevant_docs = retriever_output if isinstance(retriever_output, list) else []
+                print(f"Found {len(relevant_docs)} relevant documents")
+            except Exception as e:
+                print(f"Error retrieving documents: {str(e)}")
+                relevant_docs = []
             
-            # 檢查文檔相關性
+            # 改進文檔相關性檢查
             has_relevant_content = False
+            matched_docs = []
             if relevant_docs:
-                # 將問題轉換為字符串進行比對
                 question = request.message.lower()
+                # 擴充停用詞列表
+                stop_words = {'的', '是', '在', '有', '和', '與', '了', '嗎', '呢', '吧', '啊', '會', '能', 
+                            '什麼', '如何', '為什麼', '請問', '告訴', '說明', '想', '知道', '應該'}
                 
+                # 提取問題中的關鍵詞
+                question_words = set(word for word in question.split() 
+                                  if word not in stop_words and len(word) >= 2)
+                
+                print(f"Question keywords: {question_words}")
+                
+                # 改進相關性檢查部分
                 for doc in relevant_docs:
                     doc_content = doc.page_content.lower()
-                    print(f"Checking document: {doc_content[:200]}")
-                    has_relevant_content = True
-                    break
+                    
+                    # 分別提取標題和內容
+                    title_part = ""
+                    content_part = ""
+                    if "標題：" in doc_content and "內容：" in doc_content:
+                        parts = doc_content.split("內容：")
+                        title_part = parts[0].replace("標題：", "").strip()
+                        content_part = parts[1].strip()
+                    
+                    # 檢查完整問題是否包含在標題或內容中
+                    full_question = request.message.lower()
+                    
+                    # 分別計算標題和內容的匹配分數
+                    title_words = []
+                    content_words = []
+                    
+                    # 先檢查完整匹配
+                    if full_question in title_part or full_question in content_part:
+                        match_score = 1.0  # 完全匹配給予100%
+                        title_words = [full_question] if full_question in title_part else []
+                        content_words = [full_question] if full_question in content_part else []
+                    else:
+                        # 關鍵詞匹配
+                        for word in question_words:
+                            # 檢查每個關鍵詞是否出現在標題或內容中
+                            if word in title_part:
+                                title_words.append(word)
+                            if word in content_part:
+                                content_words.append(word)
+                        
+                        # 合併匹配的詞並去重
+                        matched_words = list(set(title_words + content_words))
+                        
+                        # 計算基礎分數
+                        match_score = len(matched_words) / len(question_words) if question_words else 0
+                        
+                        # 如果標題有匹配，給予額外加權，但確保不超過1.0
+                        if title_words:
+                            title_score = len(title_words) / len(question_words) * 1.2
+                            match_score = min(1.0, max(match_score, title_score))
+                    
+                    # 打印調試信息
+                    print(f"Document title: {title_part}")
+                    print(f"Title matched words: {title_words}")
+                    print(f"Content matched words: {content_words}")
+                    print(f"Match score: {match_score * 100}%")
+                    
+                    # 調整匹配門檻
+                    if match_score >= 0.3:  # 30% 相關度門檻
+                        has_relevant_content = True
+                        matched_docs.append({
+                            "content": doc.page_content,
+                            "score": match_score,
+                            "matched_words": title_words + content_words
+                        })
             
             if has_relevant_content:
-                # 格式化聊天歷史
-                formatted_history = []
-                if request.chat_history:
-                    for entry in request.chat_history:
-                        if isinstance(entry, dict) and "human" in entry and "ai" in entry:
-                            formatted_history.append((entry["human"], entry["ai"]))
+                # 整合所有相關文檔的內容
+                context = "\n\n".join([doc["content"] for doc in matched_docs])
                 
-                qa_chain = ConversationalRetrievalChain.from_llm(
-                    llm=llm,
-                    retriever=retriever,
-                    return_source_documents=True,
-                    verbose=True
+                # 創建更強的提示模板
+                prompt_template = """請使用以下提供的參考資料來回答問題。
+
+參考資料內容：
+{context}
+
+用戶問題：{question}
+
+請遵循以下規則回答：
+1. 必須基於參考資料的內容來優先構建回答，如果參考資料中沒有相關信息，則使用LLM進行回答
+2. 使用參考資料中的具體細節、數據和例子
+3. 以自然且流暢的方式整合這些信息
+4. 回答要有邏輯性和層次感
+5. 如果需要補充參考資料以外的信息，請明確標註「補充說明」
+
+回答格式建議：
+1. 先直接回答核心問題
+2. 然後提供具體細節和例子
+3. 最後可以補充相關建議或額外信息
+
+請開始回答："""
+
+                PROMPT = PromptTemplate(
+                    template=prompt_template,
+                    input_variables=["context", "question"]
                 )
                 
-                chain_response = qa_chain({
-                    "question": request.message,
-                    "chat_history": formatted_history
+                # 使用 LLMChain 而不是 ConversationalRetrievalChain
+                from langchain.chains import LLMChain
+                
+                chain = LLMChain(
+                    llm=llm,
+                    prompt=PROMPT
+                )
+                
+                # 生成回答
+                response = chain.invoke({
+                    "context": context,
+                    "question": request.message
                 })
                 
-                answer = chain_response.get("answer", "無法獲取回答")
-                source_docs = [doc.page_content for doc in relevant_docs if hasattr(doc, 'page_content')]
-                
                 return {
-                    "response": answer,
-                    "retrieved_docs": source_docs,
+                    "response": response["text"],
+                    "retrieved_docs": matched_docs,
                     "source": "rag"
                 }
             else:
@@ -211,7 +326,7 @@ async def startup_event():
                 
                 # 分割文本
                 text_splitter = RecursiveCharacterTextSplitter(
-                    chunk_size=500,  # 減小chunk大小
+                    chunk_size=500,  # 減chunk大小
                     chunk_overlap=50
                 )
                 texts = text_splitter.split_text(text)

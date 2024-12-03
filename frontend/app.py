@@ -168,7 +168,12 @@ if prompt := st.chat_input("請輸入您的問題"):
                             if retrieved_docs:
                                 st.markdown("### 相關參考資料")
                                 for i, doc in enumerate(retrieved_docs, 1):
-                                    st.markdown(f"**文檔 {i}:**\n{doc}")
+                                    # 格式化匹配分數為百分比
+                                    score_percentage = f"{doc['score']*100:.1f}%"
+                                    st.markdown(f"""
+                                    **文檔 {i}** (相關度: {score_percentage})
+                                    {doc['content']}
+                                    """)
                 except json.JSONDecodeError:
                     st.error("回應格式錯誤")
             else:
