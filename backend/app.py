@@ -1,14 +1,22 @@
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from langchain_community.llms import Ollama
-from langchain_community.embeddings import OllamaEmbeddings
+from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.chains import ConversationalRetrievalChain
 from langchain.prompts import PromptTemplate
 from pydantic import BaseModel
+from functools import wraps
 import os
 import json
+import logging
+import chromadb
+from chromadb.config import Settings
+
+# 配置日誌
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
@@ -21,16 +29,31 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 初始化Ollama模型
-llm = Ollama(base_url="http://localhost:11434", model="llama3.2:latest")
-embeddings = OllamaEmbeddings(base_url="http://localhost:11434", model="llama3.2:latest")
+# 定義中文語義分割符號
+chinese_separators = [
+    "\n\n",  # 段落分隔
+    "。",    # 句號
+    "！",    # 感嘆號
+    "？",    # 問號
+    "；",    # 分號
+    "：",    # 冒號
+    "\n",    # 換行
+    "，",    # 逗號
+    "、",    # 頓號
+]
 
-# 初始化向量數據庫
-if not os.path.exists("vectorstore"):
-    os.makedirs("vectorstore")
-    
-vectorstore = Chroma(persist_directory="vectorstore", embedding_function=embeddings)
+# 錯誤處理裝飾器
+def handle_exceptions(func):
+    @wraps(func)
+    async def wrapper(*args, **kwargs):
+        try:
+            return await func(*args, **kwargs)
+        except Exception as e:
+            logger.error(f"Error in {func.__name__}: {str(e)}")
+            raise HTTPException(status_code=500, detail=str(e))
+    return wrapper
 
+# 基礎類和工具函數
 class ChatRequest(BaseModel):
     message: str
     use_rag: bool
@@ -40,7 +63,69 @@ class KnowledgeBase(BaseModel):
     title: str
     content: str
 
+def initialize_vectorstore():
+    """初始化向量數據庫"""
+    # 禁用 Chroma 遙測
+    client_settings = Settings(
+        anonymized_telemetry=False,
+        allow_reset=True
+    )
+    
+    if not os.path.exists("vectorstore"):
+        os.makedirs("vectorstore")
+        
+    return Chroma(
+        persist_directory="vectorstore", 
+        embedding_function=embeddings,
+        client_settings=client_settings
+    )
+
+def load_knowledge_base(path="knowledge_base.json"):
+    """載入知識庫"""
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {"documents": []}
+
+def save_knowledge_base(data, path="knowledge_base.json"):
+    """保存知識庫"""
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=4)
+
+# 初始化全局變量
+llm = Ollama(base_url="http://localhost:11434", model="llama3.2:latest")
+embeddings = HuggingFaceEmbeddings(
+    model_name="shibing624/text2vec-base-chinese",
+    model_kwargs={'device': 'cpu'},
+    encode_kwargs={'normalize_embeddings': True}
+)
+
+# 創建全局文本分割器
+text_splitter = RecursiveCharacterTextSplitter(
+    separators=chinese_separators,
+    chunk_size=500,
+    chunk_overlap=50,
+    length_function=len,
+    is_separator_regex=False,
+    keep_separator=True
+)
+
+# 初始化向量數據庫
+vectorstore = initialize_vectorstore()
+
+def process_document(title, content):
+    """處理文檔"""
+    text = f"標題：{title}\n內容：{content}"
+    try:
+        chunks = text_splitter.split_text(text)
+        logger.info(f"Document split into {len(chunks)} chunks")
+        return chunks
+    except Exception as e:
+        logger.error(f"Error splitting text: {str(e)}")
+        return [text]
+
 @app.post("/chat")
+@handle_exceptions
 async def chat(request: ChatRequest):
     try:
         if request.use_rag:
@@ -94,11 +179,30 @@ async def chat(request: ChatRequest):
                 question = request.message.lower()
                 # 擴充停用詞列表
                 stop_words = {'的', '是', '在', '有', '和', '與', '了', '嗎', '呢', '吧', '啊', '會', '能', 
-                            '什麼', '如何', '為什麼', '請問', '告訴', '說明', '想', '知道', '應該'}
+                            '什麼', '如何', '為什麼', '請問', '告訴', '說明', '想', '知道', '應該', '甚麼'}
                 
-                # 提取問題中的關鍵詞
-                question_words = set(word for word in question.split() 
-                                  if word not in stop_words and len(word) >= 2)
+                # 將問題轉換為字符列表，同時保留完整問題
+                question_chars = list(question)  # 將問題拆分成單個字符
+                question_words = set()
+                
+                # 添加完整問題
+                question_words.add(question)
+                
+                # 添加連續的2-3個字的組合
+                for i in range(len(question_chars)):
+                    # 添加單個字（非停用詞）
+                    if question_chars[i] not in stop_words:
+                        question_words.add(question_chars[i])
+                    
+                    # 添加雙字組合
+                    if i < len(question_chars) - 1:
+                        word_2 = question_chars[i] + question_chars[i+1]
+                        question_words.add(word_2)
+                    
+                    # 添加三字組合
+                    if i < len(question_chars) - 2:
+                        word_3 = question_chars[i] + question_chars[i+1] + question_chars[i+2]
+                        question_words.add(word_3)
                 
                 print(f"Question keywords: {question_words}")
                 
@@ -114,39 +218,33 @@ async def chat(request: ChatRequest):
                         title_part = parts[0].replace("標題：", "").strip()
                         content_part = parts[1].strip()
                     
-                    # 檢查完整問題是否包含在標題或內容中
-                    full_question = request.message.lower()
-                    
                     # 分別計算標題和內容的匹配分數
                     title_words = []
                     content_words = []
                     
-                    # 先檢查完整匹配
-                    if full_question in title_part or full_question in content_part:
-                        match_score = 1.0  # 完全匹配給予100%
-                        title_words = [full_question] if full_question in title_part else []
-                        content_words = [full_question] if full_question in content_part else []
-                    else:
-                        # 關鍵詞匹配
-                        for word in question_words:
-                            # 檢查每個關鍵詞是否出現在標題或內容中
-                            if word in title_part:
-                                title_words.append(word)
-                            if word in content_part:
-                                content_words.append(word)
-                        
-                        # 合併匹配的詞並去重
-                        matched_words = list(set(title_words + content_words))
-                        
-                        # 計算基礎分數
-                        match_score = len(matched_words) / len(question_words) if question_words else 0
-                        
-                        # 如果標題有匹配，給予額外加權，但確保不超過1.0
-                        if title_words:
-                            title_score = len(title_words) / len(question_words) * 1.2
-                            match_score = min(1.0, max(match_score, title_score))
+                    # 檢查每個關鍵詞
+                    for word in question_words:
+                        # 檢查標題
+                        if word in title_part:
+                            title_words.append(word)
+                        # 檢查內容
+                        if word in content_part:
+                            content_words.append(word)
                     
-                    # 打印調試信息
+                    # 計算匹配分數，考慮詞長度
+                    match_score = 0
+                    if title_words:
+                        # 計算標題匹配分數，較長的詞給予更高權重
+                        title_score = sum(len(word) for word in title_words) / (len(question) * 1.2)
+                        match_score = max(match_score, title_score)
+                    
+                    if content_words:
+                        # 計算內容匹配分數
+                        content_score = sum(len(word) for word in content_words) / len(question)
+                        match_score = max(match_score, content_score)
+                    
+                    match_score = min(1.0, match_score)  # 確保不超過1.0
+                    
                     print(f"Document title: {title_part}")
                     print(f"Title matched words: {title_words}")
                     print(f"Content matched words: {content_words}")
@@ -229,122 +327,113 @@ async def chat(request: ChatRequest):
         return {"error": str(e)}
 
 @app.post("/add_knowledge")
+@handle_exceptions
 async def add_knowledge(knowledge: KnowledgeBase):
-    try:
-        # 清理和格式化輸入
-        title = knowledge.title.strip()
-        content = knowledge.content.strip()
-        
-        # 檢查標題和內容是否為空
-        if not title or not content:
-            return {"error": "標題和內容不能為空"}
-        
-        # 讀取現有的 JSON 文件
-        knowledge_path = "knowledge_base.json"
-        if os.path.exists(knowledge_path):
-            with open(knowledge_path, "r", encoding="utf-8") as f:
-                knowledge_base = json.load(f)
-        else:
-            knowledge_base = {"documents": []}
-        
-        # 添加新的文檔
-        new_doc = {
-            "title": title,
-            "content": content
-        }
-        knowledge_base["documents"].append(new_doc)
-        
-        # 保存更新後的 JSON 文件
-        with open(knowledge_path, "w", encoding="utf-8") as f:
-            json.dump(knowledge_base, f, ensure_ascii=False, indent=4)
-        
-        # 只將新文檔添加到向量數據庫
-        try:
-            # 創建新文檔的文本
-            text = f"標題：{title}\n內容：{content}"
-            
-            # 分割文本
-            text_splitter = RecursiveCharacterTextSplitter(
-                chunk_size=500,
-                chunk_overlap=50
-            )
-            texts = text_splitter.split_text(text)
-            
-            # 添加到向量數據庫
-            vectorstore.add_texts(texts)
-            print(f"Added new document: {title}")
-            
-            # 獲取更新後的統計信息
-            collection_stats = vectorstore._collection.count()
-            print(f"Total documents in vector store: {collection_stats}")
-            
-            return {
-                "message": "知識庫更新成功",
-                "total_documents": len(knowledge_base["documents"]),
-                "vector_store_count": collection_stats,
-                "added_document": title
-            }
-            
-        except Exception as e:
-            print(f"Error adding document to vector database: {str(e)}")
-            return {"error": f"知識庫文件已更新，但向量數據庫更新失敗: {str(e)}"}
-            
-    except Exception as e:
-        print(f"Error in add_knowledge endpoint: {str(e)}")
-        return {"error": str(e)}
+    title = knowledge.title.strip()
+    content = knowledge.content.strip()
+    
+    if not title or not content:
+        raise HTTPException(status_code=400, detail="標題和內容不能為空")
+    
+    # 載入知識庫
+    knowledge_base = load_knowledge_base()
+    
+    # 添加新文檔
+    new_doc = {"title": title, "content": content}
+    knowledge_base["documents"].append(new_doc)
+    
+    # 保存知識庫
+    save_knowledge_base(knowledge_base)
+    
+    # 添加到向量數據庫
+    chunks = process_document(title, content)
+    vectorstore.add_texts(chunks)
+    logger.info(f"Added new document: {title}")
+    
+    # 獲取統計信息
+    collection_stats = vectorstore._collection.count()
+    
+    return {
+        "message": "知識庫更新成功",
+        "total_documents": len(knowledge_base["documents"]),
+        "vector_store_count": collection_stats,
+        "added_document": title
+    }
 
-# 在應用啟動時初始化向量數據庫
 @app.on_event("startup")
 async def startup_event():
-    try:
-        global vectorstore
+    global vectorstore
+    logger.info("Starting initialization of vector database...")
+    
+    # 初始化向量數據庫
+    vectorstore = initialize_vectorstore()
+    
+    # 載入知識庫
+    knowledge_base = load_knowledge_base()
+    if knowledge_base["documents"]:
+        # 清空現有向量數據庫
+        try:
+            all_ids = vectorstore._collection.get()['ids']
+            if all_ids:
+                vectorstore._collection.delete(ids=all_ids)
+                logger.info("Cleared existing vector database")
+        except Exception as e:
+            logger.warning(f"Could not clean existing documents: {str(e)}")
         
-        # 確保向量數據庫目錄存在
-        if not os.path.exists("vectorstore"):
-            os.makedirs("vectorstore")
+        # 處理所有文檔
+        for doc in knowledge_base["documents"]:
+            chunks = process_document(doc['title'], doc['content'])
+            vectorstore.add_texts(chunks)
+            logger.info(f"Added document: {doc['title']}")
         
-        # 初始化向量數據庫
-        vectorstore = Chroma(persist_directory="vectorstore", embedding_function=embeddings)
-        
-        # 讀取JSON知識庫
-        if os.path.exists("knowledge_base.json"):
-            with open("knowledge_base.json", "r", encoding="utf-8") as f:
-                knowledge_base = json.load(f)
-            
-            # 清空現有的向量數據庫
-            try:
-                all_ids = vectorstore._collection.get()['ids']
-                if all_ids:
-                    vectorstore._collection.delete(ids=all_ids)
-            except Exception as e:
-                print(f"Warning: Could not clean existing documents: {str(e)}")
-            
-            # 處理每個文檔
-            for doc in knowledge_base["documents"]:
-                # 為每個文檔單獨創建文本並添加到向量數據庫
-                text = f"標題：{doc['title']}\n內容：{doc['content']}"
-                
-                # 分割文本
-                text_splitter = RecursiveCharacterTextSplitter(
-                    chunk_size=500,  # 減chunk大小
-                    chunk_overlap=50
-                )
-                texts = text_splitter.split_text(text)
-                
-                # 添加到向量數據庫
-                vectorstore.add_texts(texts)
-                print(f"Added document: {doc['title']}")
-            
-            print(f"Vector database initialized successfully")
-            
-            # 驗證數據庫內容
-            try:
-                collection_stats = vectorstore._collection.count()
-                print(f"Total documents in vector store: {collection_stats}")
-            except Exception as e:
-                print(f"Error checking vector store stats: {str(e)}")
-        
-    except Exception as e:
-        print(f"Error initializing vector database: {str(e)}")
-        if 'vectorstore' not in globals():
-            vectorstore = Chroma(persist_directory="vectorstore", embedding_function=embeddings)
+        logger.info("Vector database initialization completed")
+
+@app.get("/knowledge")
+@handle_exceptions
+async def get_knowledge():
+    """獲取所有知識庫內容"""
+    knowledge_base = load_knowledge_base()
+    return knowledge_base["documents"]
+
+@app.put("/knowledge/{doc_id}")
+@handle_exceptions
+async def update_knowledge(doc_id: int, knowledge: KnowledgeBase):
+    """更新知識庫中的特定文檔"""
+    knowledge_base = load_knowledge_base()
+    
+    if doc_id < 0 or doc_id >= len(knowledge_base["documents"]):
+        raise HTTPException(status_code=404, detail="文檔不存在")
+    
+    # 更新文檔
+    knowledge_base["documents"][doc_id] = {
+        "title": knowledge.title.strip(),
+        "content": knowledge.content.strip()
+    }
+    
+    # 保存更新
+    save_knowledge_base(knowledge_base)
+    
+    # 重新初始化向量數據庫
+    await startup_event()
+    
+    return {"message": "文檔更新成功"}
+
+@app.delete("/knowledge/{doc_id}")
+@handle_exceptions
+async def delete_knowledge(doc_id: int):
+    """刪除知識庫中的特定文檔"""
+    knowledge_base = load_knowledge_base()
+    
+    if doc_id < 0 or doc_id >= len(knowledge_base["documents"]):
+        raise HTTPException(status_code=404, detail="文檔不存在")
+    
+    # 刪除文檔
+    knowledge_base["documents"].pop(doc_id)
+    
+    # 保存更新
+    save_knowledge_base(knowledge_base)
+    
+    # 重新初始化向量數據庫
+    await startup_event()
+    
+    return {"message": "文檔刪除成功"}

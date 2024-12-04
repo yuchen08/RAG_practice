@@ -24,28 +24,22 @@ if current_rag_state != st.session_state.previous_rag_state:
 
 st.session_state.use_rag = current_rag_state
 
-# 知識庫添加區域
-with st.expander("新增知識庫內容"):
-    st.markdown("""
-    ### 知識庫添加說明
-    請輸入您要添加的知識內容，系統會自動處理格式。
+# 知識庫管理區域
+with st.expander("知識庫管理"):
+    st.markdown("### 知識庫管理")
     
-    您可以使用：
-    - 條列項目（數字或破折號）
-    - 具體數據說明
-    - 詳細文字描述
-    """)
-    
-    knowledge_title = st.text_input(
-        "標題",
-        placeholder="例如：台灣科技產業概況",
-        help="請輸入簡短且具體的主題描述"
-    )
-    
-    knowledge_content = st.text_area(
-        "內容",
-        height=200,
-        placeholder="""請輸入詳細內容，例如：
+    # 新增知識庫內容的表單
+    with st.form("add_knowledge_form"):
+        st.markdown("#### 新增文檔")
+        new_title = st.text_input(
+            "標題",
+            placeholder="例如：台灣科技產業概況",
+            help="請輸入簡短且具體的主題描述"
+        )
+        new_content = st.text_area(
+            "內容",
+            height=200,
+            placeholder="""請輸入詳細內容，例如：
 
 台灣是全球半導體產業的重要基地，台積電(TSMC)作為全球最大的晶圓代工廠...
 
@@ -56,58 +50,89 @@ with st.expander("新增知識庫內容"):
 或是使用破折號：
 - 重點一：具體說明
 - 重點二：具體說明""",
-        help="可使用條列項目或段落描述，建議包含具體數據或例子"
-    )
-    
-    if st.button("添加到知識庫"):
-        if knowledge_title and knowledge_content:
-            # 清理和格式化輸入
-            title = knowledge_title.strip()
-            content = knowledge_content.strip()
-            
-            # 檢查格式
-            if len(title) < 2:
-                st.error("標題太短，請輸入更具體的描述")
-            elif len(content) < 10:
-                st.error("內容太短，請提供更詳細的資訊")
-            else:
+            help="可使用條列項目或段落描述，建議包含具體數據或例子"
+        )
+        
+        if st.form_submit_button("新增文檔"):
+            if new_title and new_content:
                 try:
-                    # 自動格式化內容
-                    formatted_title = title
-                    formatted_content = content
-                    
                     response = requests.post(
                         "http://localhost:8000/add_knowledge",
                         json={
-                            "title": formatted_title,
-                            "content": formatted_content
+                            "title": new_title,
+                            "content": new_content
                         }
                     )
                     
                     if response.status_code == 200:
-                        response_data = response.json()
-                        st.success("知識庫更新成功！")
-                        # 清空輸入框
-                        st.session_state.knowledge_title = ""
-                        st.session_state.knowledge_content = ""
-                        # 顯示添加的內容和狀態
-                        st.markdown(f"""
-                        ### 已添加的內容：
-                        標題：{formatted_title}
-                        內容：{formatted_content}
-                        
-                        ### 知識庫狀態：
-                        - 總文檔數：{response_data.get('total_documents', 'N/A')}
-                        - 向量存儲數：{response_data.get('vector_store_count', 'N/A')}
-                        - 新增文檔：{response_data.get('added_document', 'N/A')}
-                        """)
+                        st.success("文檔新增成功")
+                        st.rerun()
                     else:
-                        error_msg = response.json().get("error", "未知錯誤")
-                        st.error(f"發生錯誤：{error_msg}")
+                        st.error("新增失敗")
                 except Exception as e:
                     st.error(f"發生錯誤：{str(e)}")
+            else:
+                st.warning("標題和內容都不能為空")
+    
+    st.markdown("---")
+    
+    # 顯示和編輯現有文檔
+    st.markdown("#### 現有文檔")
+    try:
+        response = requests.get("http://localhost:8000/knowledge")
+        if response.status_code == 200:
+            documents = response.json()
+            
+            if not documents:
+                st.info("目前沒有任何文檔")
+            
+            for i, doc in enumerate(documents):
+                with st.container():
+                    st.markdown(f"##### 文檔 {i+1}")
+                    
+                    # 使用表單進行編輯
+                    with st.form(f"edit_form_{i}"):
+                        edited_title = st.text_input("標題", doc["title"], key=f"title_{i}")
+                        edited_content = st.text_area("內容", doc["content"], key=f"content_{i}")
+                        
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            if st.form_submit_button("更新"):
+                                try:
+                                    response = requests.put(
+                                        f"http://localhost:8000/knowledge/{i}",
+                                        json={
+                                            "title": edited_title,
+                                            "content": edited_content
+                                        }
+                                    )
+                                    if response.status_code == 200:
+                                        st.success("文檔更新成功")
+                                        st.rerun()
+                                    else:
+                                        st.error("更新失敗")
+                                except Exception as e:
+                                    st.error(f"發生錯誤：{str(e)}")
+                        
+                        with col2:
+                            if st.form_submit_button("刪除", type="primary"):
+                                try:
+                                    response = requests.delete(
+                                        f"http://localhost:8000/knowledge/{i}"
+                                    )
+                                    if response.status_code == 200:
+                                        st.success("文檔刪除成功")
+                                        st.rerun()
+                                    else:
+                                        st.error("刪除失敗")
+                                except Exception as e:
+                                    st.error(f"發生錯誤：{str(e)}")
+                    
+                    st.markdown("---")
         else:
-            st.warning("標題和內容都不能為空")
+            st.error("無法獲取知識庫內容")
+    except Exception as e:
+        st.error(f"發生錯誤：{str(e)}")
 
 # 顯示聊天歷史
 for message in st.session_state.messages:
